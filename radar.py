@@ -1,8 +1,7 @@
 
-
 import os
+import time
 import requests
-import yfinance as yf
 from datetime import datetime, timezone
 
 SYMBOLS = """
@@ -12,67 +11,159 @@ ASML.AS ADYEN.AS SAP.DE
 SHOP.TO BHP.AX NU SOFI PLTR
 """.split()
 
+API_URL = "https://finnhub.io/api/v1"
+
+
+def fetch(endpoint, symbol, **params):
+    key = os.environ.get("FINNHUB_API_KEY")
+
+    if not key:
+        return None, "API Key ontbreekt"
+
+    time.sleep(1.2)
+
+    try:
+        response = requests.get(
+            f"{API_URL}/{endpoint}",
+            headers={"X-Finnhub-Token": key},
+            params={"symbol": symbol, **params},
+            timeout=15
+        )
+
+        if response.status_code == 429:
+            return None, "API limiet bereikt"
+
+        if response.status_code == 403:
+            return None, "Geen toegang binnen abonnement"
+
+        if response.status_code == 401:
+            return None, "API Key geweigerd"
+
+        if not response.ok:
+            return None, f"HTTP {response.status_code}"
+
+        data = response.json()
+
+        if isinstance(data, dict) and data.get("error"):
+            return None, "Finnhub geeft een foutmelding"
+
+        return data, None
+
+    except Exception:
+        return None, "Verbindingsfout"
+
 
 def scan(symbols=SYMBOLS):
     rows = []
 
     for symbol in symbols:
-        try:
-            stock = yf.Ticker(symbol)
-            info = stock.info
+        row = {
+            "symbol": symbol,
+            "price": None,
+            "currency": None,
+            "change_pct": None,
+            "target": None,
+            "upside": None,
+            "analysts": None,
+            "revenue_growth": None,
+            "score": None,
+            "source": "Finnhub",
+            "status": "Onvoldoende data",
+            "checked": datetime.now(
+                timezone.utc
+            ).isoformat()
+        }
 
-            price = (
-                info.get("currentPrice")
-                or info.get("regularMarketPrice")
+        quote, error = fetch("quote", symbol)
+
+        if error:
+            row["status"] = error
+            rows.append(row)
+            continue
+
+        if not isinstance(quote, dict) or not quote.get("c"):
+            row["status"] = "Geen koers beschikbaar"
+            rows.append(row)
+            continue
+
+        row["price"] = quote["c"]
+        row["change_pct"] = quote.get("dp")
+
+        profile, _ = fetch("stock/profile2", symbol)
+
+        if isinstance(profile, dict):
+            row["currency"] = profile.get("currency")
+
+        recommendations, _ = fetch(
+            "stock/recommendation", symbol
+        )
+
+        if isinstance(recommendations, list) and recommendations:
+            latest = max(
+                recommendations,
+                key=lambda item: item.get("period", "")
             )
-            target = info.get("targetMeanPrice")
-            analysts = info.get("numberOfAnalystOpinions") or 0
-            growth = info.get("revenueGrowth")
-            average = info.get("fiftyDayAverage")
 
-            upside = None
-            score = None
+            row["analysts"] = sum(
+                latest.get(name, 0) or 0
+                for name in [
+                    "strongBuy",
+                    "buy",
+                    "hold",
+                    "sell",
+                    "strongSell"
+                ]
+            )
 
-            if price and target:
-                upside = (target / price - 1) * 100
+        target, _ = fetch("stock/price-target", symbol)
 
-            if (
-                upside is not None
-                and analysts >= 3
-                and growth is not None
-                and average
-                and price
-            ):
-                score = round(
-                    max(0, min(40, upside))
-                    + min(20, analysts)
-                    + max(0, min(25, growth * 100))
-                    + (15 if price > average else 0)
-                )
+        if isinstance(target, dict):
+            row["target"] = target.get("targetMean")
 
-            rows.append({
-                "symbol": symbol,
-                "price": price,
-                "currency": info.get("currency"),
-                "target": target,
-                "upside": upside,
-                "analysts": analysts,
-                "score": score,
-                "status": (
-                    "OK" if score is not None
-                    else "Onvoldoende data"
-                ),
-                "checked": datetime.now(
-                    timezone.utc
-                ).isoformat()
-            })
+        if row["target"] and row["price"]:
+            row["upside"] = (
+                row["target"] / row["price"] - 1
+            ) * 100
 
-        except Exception:
-            rows.append({
-                "symbol": symbol,
-                "score": None,
-                "status": "Bron niet beschikbaar"
-            })
+        financials, _ = fetch(
+            "stock/metric",
+            symbol,
+            metric="all"
+        )
+
+        metrics = {}
+
+        if isinstance(financials, dict):
+            metrics = financials.get("metric") or {}
+
+        growth = metrics.get("revenueGrowthTTMYoy")
+        average = metrics.get("50DayMovingAverage")
+
+        row["revenue_growth"] = growth
+
+        if (
+            row["upside"] is not None
+            and row["analysts"] is not None
+            and row["analysts"] >= 3
+            and growth is not None
+            and average
+            and row["price"]
+            and row["currency"] == "USD"
+            and "." not in symbol
+        ):
+            row["score"] = round(
+                max(0, min(40, row["upside"]))
+                + min(20, row["analysts"])
+                + max(0, min(25, growth))
+                + (15 if row["price"] > average else 0)
+            )
+
+            row["status"] = "OK"
+
+        else:
+            row["status"] = "Koers OK - analyse onvolledig"
+
+        rows.append(row)
 
     return rows
 
@@ -92,13 +183,12 @@ def notify(rows):
     ]
 
     if not hits:
-        print("Geen nieuwe onderzoekssignalen")
+        print("Geen geldige onderzoekssignalen")
         return
 
     message = (
         "AI STOCK RADAR\n"
-        "Potentiele onderzoekskansen\n"
-        "Geen koopadvies\n\n"
+        "Onderzoekssignalen - geen koopadvies\n\n"
     )
 
     for row in hits:
@@ -108,14 +198,19 @@ def notify(rows):
             f"Koerspotentieel: {row['upside']:.1f}%\n\n"
         )
 
-    response = requests.post(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        json={
-            "chat_id": chat,
-            "text": message
-        },
-        timeout=20
-    )
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={
+                "chat_id": chat,
+                "text": message[:4000]
+            },
+            timeout=20
+        )
+    except requests.RequestException:
+        raise RuntimeError(
+            "Telegram verbindingsfout"
+        ) from None
 
     if not response.ok:
         raise RuntimeError("Telegram verzending mislukt")
@@ -125,5 +220,16 @@ def notify(rows):
 
 if __name__ == "__main__":
     results = scan()
-    print(f"Scan voltooid: {len(results)} aandelen")
+
+    valid = sum(
+        row["price"] is not None
+        for row in results
+    )
+
+    print(f"Aandelen gescand: {len(results)}")
+    print(f"Koersen ontvangen: {valid}")
+
+    if valid == 0:
+        raise RuntimeError("Geen koersen ontvangen")
+
     notify(results)
