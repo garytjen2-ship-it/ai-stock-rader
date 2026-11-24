@@ -1,7 +1,7 @@
 
-
 import streamlit as st
 import pandas as pd
+import os
 from radar import scan, SYMBOLS
 
 st.set_page_config(
@@ -10,8 +10,17 @@ st.set_page_config(
     layout="wide"
 )
 
+key = st.secrets.get("FINNHUB_API_KEY")
+
+if key:
+    os.environ["FINNHUB_API_KEY"] = key
+
 st.title("📈 AI Stock Radar")
-st.caption("Worldwide Stock Intelligence")
+st.caption("Worldwide Stock Intelligence - V0.2")
+
+if not os.environ.get("FINNHUB_API_KEY"):
+    st.error("Finnhub API Key ontbreekt in Secrets.")
+    st.stop()
 
 st.sidebar.header("Instellingen")
 
@@ -25,31 +34,32 @@ threshold = st.sidebar.slider(
     0, 100, 75
 )
 
-
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_data(tickers):
     return scan(tickers)
-
 
 if st.sidebar.button("🔄 Vernieuw scan"):
     load_data.clear()
 
 tickers = tuple(
     dict.fromkeys(symbols.upper().split())
-)[:50]
+)[:16]
 
-with st.spinner("Financiele gegevens ophalen..."):
-    rows = load_data(tickers)
+st.sidebar.caption(
+    "Maximaal 16 aandelen per scan in deze versie."
+)
 
-df = pd.DataFrame(rows)
+with st.spinner("Finnhub gegevens ophalen..."):
+    df = pd.DataFrame(load_data(tickers))
 
 if df.empty:
     st.warning("Geen aandelen beschikbaar.")
     st.stop()
 
-df["score"] = pd.to_numeric(
-    df["score"], errors="coerce"
-)
+for column in ["score", "price", "upside", "change_pct"]:
+    df[column] = pd.to_numeric(
+        df[column], errors="coerce"
+    )
 
 df = df.sort_values(
     "score",
@@ -57,23 +67,49 @@ df = df.sort_values(
     na_position="last"
 )
 
+valid_prices = df["price"].notna().sum()
+valid_scores = df["score"].notna().sum()
+
 opportunities = df[df["score"] >= threshold]
 
-a, b, c = st.columns(3)
+a, b, c, d = st.columns(4)
 
 a.metric("Gevolgde aandelen", len(df))
-b.metric("Potentiele kansen", len(opportunities))
-c.metric("Databronnen", 1)
+b.metric("Beschikbare koersen", int(valid_prices))
+c.metric("Volledige analyses", int(valid_scores))
+d.metric(
+    "Onderzoekskansen",
+    len(opportunities) if valid_scores else "Onbekend"
+)
 
-st.subheader("🎯 Potentiele kansen")
+if valid_prices == 0:
+    st.error("Geen koersen ontvangen van Finnhub.")
 
-if opportunities.empty:
-    st.info("Geen aandelen boven de ingestelde score.")
+elif valid_prices < len(df):
+    st.warning(
+        "Niet alle aandelen zijn beschikbaar "
+        "via jouw Finnhub abonnement."
+    )
+
+if valid_scores == 0:
+    st.warning(
+        "Er zijn nog onvoldoende gegevens "
+        "om betrouwbare scores te berekenen."
+    )
+
+st.subheader("🎯 Potentiele onderzoekskansen")
+
+if valid_scores == 0:
+    st.info("Nog geen volledige analyses beschikbaar.")
+
+elif opportunities.empty:
+    st.info("Geen berekende scores boven de ingestelde grens.")
+
 else:
     st.dataframe(
         opportunities,
         hide_index=True,
-        use_container_width=True
+        width="stretch"
     )
 
 st.subheader("📊 Alle gevolgde aandelen")
@@ -81,7 +117,27 @@ st.subheader("📊 Alle gevolgde aandelen")
 st.dataframe(
     df,
     hide_index=True,
-    use_container_width=True
+    width="stretch",
+    column_config={
+        "symbol": "Aandeel",
+        "price": st.column_config.NumberColumn(
+            "Koers", format="%.2f"
+        ),
+        "currency": "Valuta",
+        "change_pct": st.column_config.NumberColumn(
+            "Dagverschil (%)", format="%.2f"
+        ),
+        "target": "Koersdoel",
+        "upside": st.column_config.NumberColumn(
+            "Potentieel (%)", format="%.2f"
+        ),
+        "analysts": "Analisten",
+        "revenue_growth": "Omzetgroei (%)",
+        "score": "Kansscore",
+        "source": "Databron",
+        "status": "Status",
+        "checked": "Gecontroleerd (UTC)"
+    }
 )
 
 st.subheader("🏆 Hoogste scores")
@@ -96,6 +152,7 @@ if not ranked.empty:
 st.subheader("🌐 Informatiebronnen")
 
 st.markdown("""
+- [Finnhub](https://finnhub.io/)
 - [Yahoo Finance](https://finance.yahoo.com)
 - [TipRanks](https://www.tipranks.com)
 - [Morningstar](https://www.morningstar.com)
@@ -110,12 +167,13 @@ st.markdown("""
 """)
 
 st.caption(
-    "Automatische data: Yahoo Finance via yfinance. "
-    "Overige websites zijn voorlopig snelkoppelingen."
+    "Automatische databron: Finnhub. "
+    "Overige websites zijn snelkoppelingen."
 )
 
 st.warning(
-    "Dit is een prototype. Scores zijn niet historisch "
-    "gevalideerd. Koersdoelen zijn geen garanties. "
+    "Experimenteel onderzoeksdashboard. "
+    "Scores zijn niet historisch gevalideerd. "
+    "Koersdoelen zijn geen garanties. "
     "Geen financieel advies."
 )
