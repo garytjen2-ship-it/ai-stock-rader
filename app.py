@@ -1,179 +1,123 @@
-
-import streamlit as st
-import pandas as pd
 import os
-from radar import scan, SYMBOLS
+import re
 
-st.set_page_config(
-    page_title="AI Stock Radar",
-    page_icon="📈",
-    layout="wide"
-)
+import pandas as pd
+import streamlit as st
 
-key = st.secrets.get("FINNHUB_API_KEY")
+from radar import ALERT_THRESHOLD, QUOTE_MAX_AGE, SYMBOLS, TARGET_MAX_AGE, VERSION, scan
 
-if key:
-    os.environ["FINNHUB_API_KEY"] = key
+st.set_page_config(page_title="AI Stock Radar", page_icon="📈", layout="wide")
 
-st.title("📈 AI Stock Radar")
-st.caption("Worldwide Stock Intelligence - V0.2")
+api_key = os.environ.get("FINNHUB_API_KEY")
+if not api_key:
+    try:
+        api_key = st.secrets.get("FINNHUB_API_KEY")
+    except FileNotFoundError:
+        api_key = None
 
-if not os.environ.get("FINNHUB_API_KEY"):
-    st.error("Finnhub API Key ontbreekt in Secrets.")
+st.title(f"📈 AI Stock Radar V{VERSION}")
+st.caption("Internationale aandelen · koersen, koersdoelen en indicatieve onderzoeksscores")
+
+st.sidebar.header("Scaninstellingen")
+symbols = st.sidebar.text_area("Aandelentickers", " ".join(SYMBOLS))
+threshold = st.sidebar.slider("Minimale onderzoeksscore", 0, 100, ALERT_THRESHOLD)
+tickers = tuple(dict.fromkeys(symbols.upper().split()))
+st.sidebar.caption("Maximaal 16 tickers, gescheiden door spaties.")
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_data(tickers, api_key):
+    return scan(tickers, api_key=api_key)
+
+
+if st.sidebar.button("Vernieuw scan"):
+    load_data.clear(tickers, api_key or "")
+
+if not tickers or len(tickers) > 16 or any(
+    not re.fullmatch(r"[A-Z0-9][A-Z0-9.\-]{0,19}", symbol) for symbol in tickers
+):
+    st.warning("Voer 1 tot 16 geldige tickers in, bijvoorbeeld ASML.AS of SHOP.TO.")
     st.stop()
 
-st.sidebar.header("Instellingen")
+if not api_key:
+    st.info("Yahoo Finance is actief. Voeg een Finnhub-sleutel toe aan de serverconfiguratie om beide bronnen te gebruiken.")
 
-symbols = st.sidebar.text_area(
-    "Aandelen tickers",
-    " ".join(SYMBOLS)
-)
+with st.spinner("Marktgegevens ophalen…"):
+    df = pd.DataFrame(load_data(tickers, api_key or ""))
 
-threshold = st.sidebar.slider(
-    "Minimale kansscore",
-    0, 100, 75
-)
+for column in ("price", "change_pct", "target", "upside", "analysts", "revenue_growth", "average", "score"):
+    df[column] = pd.to_numeric(df[column], errors="coerce")
+last_checked = pd.to_datetime(df["checked"], utc=True, errors="coerce").max()
+df["price_session"] = df["price_session"].map(lambda session: session.isoformat() if session is not None else None)
+for column in ("price_at", "target_at"):
+    df[column] = pd.to_datetime(df[column], utc=True, errors="coerce").dt.strftime("%Y-%m-%d %H:%M")
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_data(tickers):
-    return scan(tickers)
-
-if st.sidebar.button("🔄 Vernieuw scan"):
-    load_data.clear()
-
-tickers = tuple(
-    dict.fromkeys(symbols.upper().split())
-)[:16]
-
-st.sidebar.caption(
-    "Maximaal 16 aandelen per scan in deze versie."
-)
-
-with st.spinner("Finnhub gegevens ophalen..."):
-    df = pd.DataFrame(load_data(tickers))
-
-if df.empty:
-    st.warning("Geen aandelen beschikbaar.")
-    st.stop()
-
-for column in ["score", "price", "upside", "change_pct"]:
-    df[column] = pd.to_numeric(
-        df[column], errors="coerce"
-    )
-
-df = df.sort_values(
-    "score",
-    ascending=False,
-    na_position="last"
-)
-
-valid_prices = df["price"].notna().sum()
-valid_scores = df["score"].notna().sum()
-
-opportunities = df[df["score"] >= threshold]
+df = df.sort_values("score", ascending=False, na_position="last", kind="stable")
+ranked = df.dropna(subset=["score"])
+opportunities = ranked[ranked["score"] >= threshold]
+current = int(df["price_age"].eq("Binnen grens").sum())
+targets = int(df["target"].notna().sum())
 
 a, b, c, d = st.columns(4)
-
 a.metric("Gevolgde aandelen", len(df))
-b.metric("Beschikbare koersen", int(valid_prices))
-c.metric("Volledige analyses", int(valid_scores))
-d.metric(
-    "Onderzoekskansen",
-    len(opportunities) if valid_scores else "Onbekend"
+b.metric("Actuele koersen", f"{current}/{len(df)}")
+c.metric("Koersdoelen beschikbaar", f"{targets}/{len(df)}")
+d.metric("Berekende scores", f"{len(ranked)}/{len(df)}")
+st.caption(f"Laatste scan voltooid om {last_checked:%Y-%m-%d %H:%M} UTC · cache maximaal 15 minuten")
+
+columns = {
+    "symbol": "Aandeel",
+    "price": st.column_config.NumberColumn("Koers", format="%.2f"),
+    "currency": "Handelsvaluta",
+    "change_pct": st.column_config.NumberColumn("Dagverschil (%)", format="%+.2f"),
+    "price_source": "Koersbron",
+    "price_at": "Koerstijd (UTC)",
+    "price_session": "Lokale beurssessie",
+    "price_basis": "Koerstype",
+    "price_age": "Actualiteit koers",
+    "target": st.column_config.NumberColumn("Koersdoel", format="%.2f"),
+    "target_currency": "Valuta koersdoel",
+    "target_source": "Bron koersdoel",
+    "target_at": "Datum koersdoel (UTC)",
+    "target_age": "Actualiteit koersdoel",
+    "upside": st.column_config.NumberColumn("Potentieel (%)", format="%+.2f"),
+    "analysts": st.column_config.NumberColumn("Analisten", format="%d"),
+    "analysts_source": "Bron analistendekking",
+    "revenue_growth": st.column_config.NumberColumn("Omzetgroei (%)", format="%+.2f"),
+    "growth_source": "Bron omzetgroei",
+    "growth_basis": "Periode omzetgroei",
+    "average": st.column_config.NumberColumn("50-daags gemiddelde", format="%.2f"),
+    "average_source": "Bron gemiddelde",
+    "score": st.column_config.NumberColumn("Onderzoeksscore", format="%d"),
+    "status": "Status",
+}
+overview = (
+    "symbol", "score", "price", "currency", "target", "upside", "price_source",
+    "target_source", "price_age", "target_age", "status",
 )
 
-if valid_prices == 0:
-    st.error("Geen koersen ontvangen van Finnhub.")
-
-elif valid_prices < len(df):
-    st.warning(
-        "Niet alle aandelen zijn beschikbaar "
-        "via jouw Finnhub abonnement."
-    )
-
-if valid_scores == 0:
-    st.warning(
-        "Er zijn nog onvoldoende gegevens "
-        "om betrouwbare scores te berekenen."
-    )
-
-st.subheader("🎯 Potentiele onderzoekskansen")
-
-if valid_scores == 0:
-    st.info("Nog geen volledige analyses beschikbaar.")
-
-elif opportunities.empty:
-    st.info("Geen berekende scores boven de ingestelde grens.")
-
+st.subheader("Onderzoekskansen")
+if opportunities.empty:
+    st.info("Geen scores berekend." if ranked.empty else f"Geen scores vanaf {threshold}.")
 else:
-    st.dataframe(
-        opportunities,
-        hide_index=True,
-        width="stretch"
-    )
+    st.dataframe(opportunities[list(overview)], column_config=columns, hide_index=True, use_container_width=True)
 
-st.subheader("📊 Alle gevolgde aandelen")
-
-st.dataframe(
-    df,
-    hide_index=True,
-    width="stretch",
-    column_config={
-        "symbol": "Aandeel",
-        "price": st.column_config.NumberColumn(
-            "Koers", format="%.2f"
-        ),
-        "currency": "Valuta",
-        "change_pct": st.column_config.NumberColumn(
-            "Dagverschil (%)", format="%.2f"
-        ),
-        "target": "Koersdoel",
-        "upside": st.column_config.NumberColumn(
-            "Potentieel (%)", format="%.2f"
-        ),
-        "analysts": "Analisten",
-        "revenue_growth": "Omzetgroei (%)",
-        "score": "Kansscore",
-        "source": "Databron",
-        "status": "Status",
-        "checked": "Gecontroleerd (UTC)"
-    }
-)
-
-st.subheader("🏆 Hoogste scores")
-
-ranked = df.dropna(subset=["score"]).head(10)
+st.subheader("Alle gevolgde aandelen")
+st.dataframe(df[list(overview)], column_config=columns, hide_index=True, use_container_width=True)
 
 if not ranked.empty:
-    st.bar_chart(
-        ranked.set_index("symbol")["score"]
-    )
+    with st.expander("Hoogste onderzoeksscores"):
+        st.bar_chart(ranked.head(10).set_index("symbol")["score"])
 
-st.subheader("🌐 Informatiebronnen")
+with st.expander("Datums, brongegevens en score-invoer"):
+    st.dataframe(df[list(columns)], column_config=columns, hide_index=True, use_container_width=True)
 
-st.markdown("""
-- [Finnhub](https://finnhub.io/)
-- [Yahoo Finance](https://finance.yahoo.com)
-- [TipRanks](https://www.tipranks.com)
-- [Morningstar](https://www.morningstar.com)
-- [MarketScreener](https://www.marketscreener.com)
-- [Stock Analysis](https://stockanalysis.com)
-- [TradingView](https://www.tradingview.com)
-- [Reuters](https://www.reuters.com/markets/)
-- [Seeking Alpha](https://seekingalpha.com)
-- [Koyfin](https://www.koyfin.com)
-- [Simply Wall St](https://simplywall.st)
-- [X / Twitter](https://x.com)
+with st.expander("Databronnen en scoreberekening"):
+    st.markdown(f"""
+- [Finnhub](https://finnhub.io/docs/api) en [Yahoo Finance](https://finance.yahoo.com/) leveren marktgegevens. Finnhub wordt geraadpleegd voor de Amerikaanse noteringen uit de standaardlijst. Yahoo Finance levert ook gegevens voor de andere beurzen.
+- Een koers telt maximaal {QUOTE_MAX_AGE.days} kalenderdagen als actueel, gerekend in de beurstijdzone als die bekend is. Gedateerde koersdoelen mogen maximaal {TARGET_MAX_AGE.days} kalenderdagen oud zijn. Een ongedateerd koersdoel telt indicatief mee en krijgt het label ‘Datum onbekend’.
+- De score kent maximaal 40 punten toe voor koerspotentieel, 20 voor analistendekking, 25 voor omzetgroei en 15 als de koers boven het 50-daags gemiddelde ligt. Voor een score zijn minimaal drie analisten en alle vier invoerwaarden nodig.
+- Bij Yahoo Finance kan de omzetgroei op kwartaalbasis zijn. Finnhub gebruikt twaalfmaandsomzet. Het dashboard toont de gebruikte periode.
 """)
 
-st.caption(
-    "Automatische databron: Finnhub. "
-    "Overige websites zijn snelkoppelingen."
-)
-
-st.warning(
-    "Experimenteel onderzoeksdashboard. "
-    "Scores zijn niet historisch gevalideerd. "
-    "Koersdoelen zijn geen garanties. "
-    "Geen financieel advies."
-)
+st.caption("De scores zijn indicatief en niet historisch gevalideerd. Geen financieel advies.")
