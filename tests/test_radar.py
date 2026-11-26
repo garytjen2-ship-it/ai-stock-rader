@@ -159,8 +159,32 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(data["price_at"], NOW)
         self.assertEqual(data["growth"], 18)
         ticker.history.assert_called_once_with(
-            period="1mo", interval="1d", auto_adjust=False, timeout=8, raise_errors=True
+            period="1mo", interval="1d", auto_adjust=False, timeout=8
         )
+
+    def test_yahoo_preserves_partial_ticker_info_with_default_error_handling(self):
+        from pandas import DataFrame
+
+        ticker = Mock()
+        ticker.history.return_value = DataFrame()
+        ticker.get_history_metadata.return_value = {}
+        modules = yahoo_modules(ticker)
+        debug = SimpleNamespace(hide_exceptions=True)
+        modules["yfinance"].config = SimpleNamespace(debug=debug)
+
+        def get_info():
+            # An HTTP failure in Yahoo's second endpoint leaves the first usable.
+            if not debug.hide_exceptions:
+                raise requests.HTTPError("Quote endpoint unavailable")
+            return {"currency": "USD", "targetMeanPrice": 140, "numberOfAnalystOpinions": 12}
+
+        ticker.get_info.side_effect = get_info
+        with patch.dict(sys.modules, modules):
+            data = radar.yahoo_data("NVDA", now=NOW)
+        self.assertEqual(data["target"], 140)
+        self.assertEqual(data["analysts"], 12)
+        self.assertIn(("Yahoo historie", "Geen dagkoersen ontvangen"), data["diagnostics"])
+        self.assertTrue(debug.hide_exceptions)
 
     def test_yahoo_info_quote_fallback_and_invalid_values(self):
         ticker = Mock()
