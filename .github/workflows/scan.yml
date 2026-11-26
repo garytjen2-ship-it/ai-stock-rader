@@ -2,6 +2,8 @@
 name: AI Stock Radar Scan
 
 on:
+  push:
+    branches: [upgrade-v0.4]
   workflow_dispatch:
   pull_request:
     branches: [main]
@@ -11,34 +13,51 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: stock-radar-${{ github.event.pull_request.number || 'scan' }}
-  cancel-in-progress: false
-
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.14']
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -r requirements.txt
+      - run: python -m unittest discover -s tests -v
+        env:
+          REQUIRE_STREAMLIT_HTTP: "1"
+
   scan:
+    needs: test
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    concurrency:
+      group: stock-radar-scan
+      cancel-in-progress: false
 
     steps:
       - name: Download software
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           persist-credentials: false
 
       - name: Install Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Run software tests
-        run: python -m unittest discover -s tests -v
+        run: python -m pip install -r requirements.txt
 
       - name: Scan worldwide stocks
-        if: github.event_name != 'pull_request'
         run: python radar.py
         env:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
